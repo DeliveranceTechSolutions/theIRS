@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,8 +25,14 @@ var wg sync.WaitGroup
 var rw sync.RWMutex
 var myInt atomic.Int64
 
+const (
+    MAXPROCS = 12
+)
+
 func ParseXMLs() {
-    ledger, header := Load()
+    runtime.GOMAXPROCS(MAXPROCS)
+    // _, header := Load()  // Load function not defined
+    header := []string{"FileName", "EIN", "OrganizationName", "TaxYear", "ReturnType"} // Simple header
     sheet, err := os.Create("resolve.csv")
     if err != nil {
         panic(err)
@@ -33,7 +40,7 @@ func ParseXMLs() {
     writer := csv.NewWriter(sheet)
 
     xmler := &Xmler{
-        Record: ledger, 
+        Record: make(map[string][]string), // Initialize the map
         Writer: writer,
     }
     xmler.Writer.Write(header) 
@@ -60,45 +67,10 @@ func ParseXMLs() {
     wg.Wait()
 }
 
-func (x *Xmler) buildCSVHeader(root string, files []os.DirEntry, wg *sync.WaitGroup) {
+func (x Xmler) generateRows(root string, files []os.DirEntry, wg *sync.WaitGroup) {
     defer wg.Done()
-    for _, file := range files {
-        template := root + "/" + file.Name()
-        if file.IsDir() {
-            return
-        }
-        f, err := os.Open(template)
-        if err != nil {
-            panic(err)
-        }
 
-        decoder := xml.NewDecoder(f)
-        for {
-            tok, err := decoder.Token()
-            if err == io.EOF {
-                break
-            }
-            if err != nil {
-                log.Fatal(err)
-            }
 
-            switch elem := tok.(type) {
-            case xml.StartElement:
-                rw.Lock()
-                if _, ok := x.Record[elem.Name.Local]; !ok {
-                    x.Record[elem.Name.Local] = []string{}
-                }
-                rw.Unlock()
-            }
-        }
-        myInt.Add(1)
-        fmt.Println(myInt.Load())
-    }
-    return
-}
-
-func (x *Xmler) generateRows(root string, files []os.DirEntry, wg *sync.WaitGroup) {
-    defer wg.Done()
     for _, file := range files {
         if file.IsDir() {
             return
@@ -110,109 +82,67 @@ func (x *Xmler) generateRows(root string, files []os.DirEntry, wg *sync.WaitGrou
 
 
         decoder := xml.NewDecoder(f)
-        lastTag := "" 
-        for {
-            tok, err := decoder.Token()
-            if err == io.EOF {
-                rw.Lock()
-                var row []string
-                for _, data := range x.Record {
-                    length := len(data)
-                    if length > 1 {
-                        var insert string
-                        for _, b := range data {
-                            insert += b
-                        }
+        x.flatten(xml.StartElement{}, decoder, "")
+    }
 
-                        row = append(row, insert)   
-                    } else if length == 1 {
-                        row = append(row, string(data[0]))
-                    } else if length == 0 {
-                        row = append(row, "")
+    return
+}
+
+func (x Xmler) flatten(element xml.StartElement, decoder *xml.Decoder, prefix string) {
+    var lastTag string
+    for {
+        tok, err := decoder.Token()
+        if err == io.EOF {
+            rw.Lock()
+            var row []string
+            for _, data := range x.Record {
+                length := len(data)
+                if length > 1 {
+                    var insert string
+                    for _, b := range data {
+                        insert += b
                     }
-                }
-                x.Writer.Write(row)
-                x.Writer.Flush()
-                rw.Unlock()
-                myInt.Add(1)
-                fmt.Println(myInt.Load())
-                x.Record = make(map[string][]string)
 
-                break
-            }
-            if err != nil {
-                log.Fatal(err)
+                    row = append(row, insert)   
+                } else if length == 1 {
+                    row = append(row, string(data[0]))
+                } else if length == 0 {
+                    row = append(row, "")
+                }
             }
 
-            switch elem := tok.(type) {
-            case xml.StartElement:
-                rw.Lock()
-                if _, ok := x.Record[elem.Name.Local]; !ok {
-                    x.Record[elem.Name.Local] = []string{}
-                    lastTag = elem.Name.Local
-                }
-                rw.Unlock()
-            case xml.EndElement:
-                lastTag = ""
-            case xml.CharData:
-                data := strings.TrimSpace(string(elem))
-                if len(data) > 0 && lastTag != "" {
-                    rw.Lock()
-                    x.Record[lastTag] = append(x.Record[lastTag], data)
-                    rw.Unlock()
-                }
-            }
+            x.Writer.Write(row)
+            x.Writer.Flush()
+            rw.Unlock()
+            //x.Record, _ = Load() 
+            myInt.Add(1)
+            fmt.Println(myInt.Load())
+            break
         }
-    }
-
-    return
-}
-
-func (x Xmler) buildAndWriteCSVRows() {
-    var header []string
-    var data []string
-    rw.Lock()
-    for col, row := range x.Record {
-        header = append(header, col) 
-        data = append(data, row...)
-    }
-
-    x.Writer.Write(header)
-    x.Writer.Write(data) 
-    x.Writer.Flush()
-    rw.Unlock()
-}
-
-func convertCollection(root string, files []os.DirEntry) {
-    for _, file := range files {
-        f, err := os.Open(root + "/" + file.Name())
         if err != nil {
-            panic(err)
+            log.Fatal(err)
         }
+        switch t := tok.(type) {
+        case xml.StartElement:
+            fullTag := prefix + "." + t.Name.Local
+            lastTag = t.Name.Local
+            element = t
+            x.flatten(t, decoder, fullTag)
 
-
-        decoder := xml.NewDecoder(f)
-        for {
-            tok, err := decoder.Token()
-            if err == io.EOF {
-                break
+        case xml.CharData:
+            rw.Lock()
+            val := strings.TrimSpace(string(t))
+            if val != "" {
+                x.Record[prefix] = append(x.Record[prefix], val)
             }
-            if err != nil {
-                log.Fatal(err)
+            if _, ok := x.Record[lastTag]; !ok {
+                x.Record[lastTag] = []string{}
             }
+            rw.Unlock()
 
-            switch elem := tok.(type) {
-            case xml.StartElement:
-                if strings.Contains(elem.Name.Local, "Return") {
-                    fmt.Println("Start element:", elem.Name.Local)
-                }
-            case xml.EndElement:
-                //fmt.Println("End element:", elem.Name.Local)
-            case xml.CharData:
-                // data := strings.TrimSpace(string(elem))
-                // if len(data) > 0 {
-                //     fmt.Println("Text:", data)
-                // }
+        case xml.EndElement:
+            if t.Name.Local == element.Name.Local {
+                return
             }
         }
     }
