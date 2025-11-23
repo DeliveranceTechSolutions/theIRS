@@ -12,7 +12,7 @@ import (
     "strings"
 )
 
-func confirmation(s string, tries int) bool {
+func confirmation(s string, tries int) (bool, error) {
     r := bufio.NewReader(os.Stdin)
 
     for ; tries > 0; tries-- {
@@ -20,126 +20,172 @@ func confirmation(s string, tries int) bool {
 
         res, err := r.ReadString('\n')
         if err != nil {
-            log.Fatal(err)
+            return false, fmt.Errorf("failed to read input: %w", err)
         }
         // Empty input (i.e. "\n")
         if len(res) < 2 {
             continue
         }
 
-        return strings.ToLower(strings.TrimSpace(res))[0] == 'y'
+        return strings.ToLower(strings.TrimSpace(res))[0] == 'y', nil
     }
 
-    return false
+    return false, nil
+}
+
+func printUsage() {
+    fmt.Println("theIRS - IRS Form 990 Data Extraction Tool")
+    fmt.Println()
+    fmt.Println("Usage: theIRS <command>")
+    fmt.Println()
+    fmt.Println("Commands:")
+    fmt.Println("  sync      Check and download missing ZIP files (recommended)")
+    fmt.Println("  unzip     Extract all ZIP files to directories")
+    fmt.Println("  csv       Process XML files and generate CSV output")
+    fmt.Println("  schemas   Download and process XSD schema files (for developers)")
+    fmt.Println("  zips      Download all ZIP files from scratch (deprecated, use sync)")
+    fmt.Println("  help      Show this help message")
+    fmt.Println()
+    fmt.Println("Example workflow:")
+    fmt.Println("  ./theIRS sync    # Download missing files")
+    fmt.Println("  ./theIRS unzip   # Extract ZIP archives")
+    fmt.Println("  ./theIRS csv     # Generate CSV from XML files")
 }
 
 func main() {
     if len(os.Args) < 2 {
-        fmt.Println("Nah need a command")
+        printUsage()
         return
     } else if len(os.Args) > 2 {
-        fmt.Println("too many")
-        return 
+        fmt.Println("Error: Too many arguments")
+        printUsage()
+        return
     }
 
-
-
     switch os.Args[1] {
+    case "help", "-h", "--help":
+        printUsage()
+
     case "zips":
-        proceed := confirmation(`
-        This will delete any and all zip files in the ./data/990_zips directory.
-        Do not proceed with this command if you have already used it.
+        proceed, err := confirmation(`
+        This will download all ZIP files from the IRS website.
+        Files that already exist will be skipped automatically.
+        Note: The 'sync' command is recommended instead as it's more efficient.
 
         `, 3)
+        if err != nil {
+            fmt.Printf("Error reading confirmation: %v\n", err)
+            os.Exit(1)
+        }
         if proceed {
             zips, err := UnpackZips()
             if err != nil {
-                fmt.Println(err)
+                fmt.Printf("Error: %v\n", err)
+                os.Exit(1)
             }
-            fmt.Println(zips)
+            log.Printf("Downloaded %d zip files", len(zips))
         } else {
             fmt.Println("Aborting")
         }
-        break
 
     case "sync":
-        proceed := confirmation(`
+        proceed, err := confirmation(`
         This will check what zip files are already downloaded and download only the missing ones.
         This is safe to run multiple times.
-        
+
         `, 3)
+        if err != nil {
+            fmt.Printf("Error reading confirmation: %v\n", err)
+            os.Exit(1)
+        }
         if proceed {
             if err := CheckAndDownloadMissingZips(); err != nil {
                 fmt.Printf("Error: %v\n", err)
+                os.Exit(1)
             } else {
                 fmt.Println("Sync complete!")
             }
         } else {
             fmt.Println("Aborting")
         }
-        break
 
     case "schemas":
         versions, err := UnpackSchemas()
         if err != nil {
-            fmt.Println(err)
+            fmt.Printf("Error unpacking schemas: %v\n", err)
+            os.Exit(1)
         }
-        links := generateLinks(versions) 
-        fmt.Println(links)
-        UnzipSchemas()
+        links := generateLinks(versions)
+        log.Printf("Generated %d schema links", len(links))
+
+        if err := UnzipSchemas(); err != nil {
+            fmt.Printf("Error unzipping schemas: %v\n", err)
+            os.Exit(1)
+        }
+
         files, err := GlobWalk("./data/990_xsd/output", "*.xsd")
         if err != nil {
-            fmt.Println(err)
+            fmt.Printf("Error globbing XSD files: %v\n", err)
+            os.Exit(1)
         }
-        fmt.Println(files) 
+        log.Printf("Found %d XSD files", len(files))
 
-        cmd := exec.Command("bash", "chmod x+a ./models.sh; ./models.sh")
+        cmd := exec.Command("bash", "-c", "chmod +x ./models.sh && ./models.sh")
         if err := cmd.Run(); err != nil {
-            fmt.Println("pipeline failed to run", err)
+            fmt.Printf("Pipeline failed to run: %v\n", err)
+            os.Exit(1)
         } else {
             log.Println("Completed pipeline collapse")
         }
 
-        break
-
     case "unzip":
-        proceed := confirmation(`
+        proceed, err := confirmation(`
         This will extract all ZIP files in the ./data/990_zips directory.
         Each ZIP file will be extracted to its own directory.
-        
+
         `, 3)
+        if err != nil {
+            fmt.Printf("Error reading confirmation: %v\n", err)
+            os.Exit(1)
+        }
         if proceed {
             if err := ExtractAllZips(); err != nil {
                 fmt.Printf("Error: %v\n", err)
+                os.Exit(1)
             } else {
                 fmt.Println("Unzip complete!")
             }
         } else {
             fmt.Println("Aborting")
         }
-        break
 
     case "csv":
-        proceed := confirmation(`
+        proceed, err := confirmation(`
         This will process all XML files in the ./data/990_zips directories
         and create a comprehensive CSV file with IRS Form 990 data.
-        
+
         Output file: irs_990_data.csv
-        
+
         `, 3)
+        if err != nil {
+            fmt.Printf("Error reading confirmation: %v\n", err)
+            os.Exit(1)
+        }
         if proceed {
             if err := ProcessAllDirectories(); err != nil {
                 fmt.Printf("Error: %v\n", err)
+                os.Exit(1)
             } else {
                 fmt.Println("CSV generation complete! Check irs_990_data.csv")
             }
         } else {
             fmt.Println("Aborting")
         }
-        break
 
     default:
-        fmt.Println("the argument provided doesn't exist")
+        fmt.Printf("Error: Unknown command '%s'\n\n", os.Args[1])
+        printUsage()
+        os.Exit(1)
     }
 }
 
@@ -156,34 +202,49 @@ func generateLinks(versions map[string]Version) []string {
 // ExtractAllZips extracts all ZIP files in the data/990_zips directory
 func ExtractAllZips() error {
     zipDir := "./data/990_zips"
-    
+
     // Read all files in the directory
     entries, err := os.ReadDir(zipDir)
     if err != nil {
         return fmt.Errorf("failed to read directory: %w", err)
     }
-    
+
     var extractedCount int
+    var skippedCount int
+
     for _, entry := range entries {
         if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".zip") {
             continue
         }
-        
+
         zipPath := filepath.Join(zipDir, entry.Name())
         extractDir := filepath.Join(zipDir, strings.TrimSuffix(entry.Name(), ".zip"))
-        
+
+        // Check if already extracted (directory exists and has files)
+        if dirInfo, err := os.Stat(extractDir); err == nil && dirInfo.IsDir() {
+            // Check if directory has content
+            dirEntries, err := os.ReadDir(extractDir)
+            if err == nil && len(dirEntries) > 0 {
+                skippedCount++
+                fmt.Printf("⏭  Skipping %s (already extracted, %d files)\n", entry.Name(), len(dirEntries))
+                continue
+            }
+        }
+
         fmt.Printf("Extracting %s to %s...\n", entry.Name(), extractDir)
-        
+
         if err := extractZip(zipPath, extractDir); err != nil {
             fmt.Printf("Error extracting %s: %v\n", entry.Name(), err)
             continue
         }
-        
+
         extractedCount++
         fmt.Printf("✓ Successfully extracted %s\n", entry.Name())
     }
-    
-    fmt.Printf("Extraction complete! Extracted %d ZIP files.\n", extractedCount)
+
+    fmt.Printf("\nExtraction complete!\n")
+    fmt.Printf("  Extracted: %d ZIP files\n", extractedCount)
+    fmt.Printf("  Skipped:   %d ZIP files (already extracted)\n", skippedCount)
     return nil
 }
 

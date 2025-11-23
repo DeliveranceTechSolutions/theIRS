@@ -29,108 +29,154 @@ const (
     MAXPROCS = 12
 )
 
-func ParseXMLs() {
+func ParseXMLs() error {
     runtime.GOMAXPROCS(MAXPROCS)
     // _, header := Load()  // Load function not defined
     header := []string{"FileName", "EIN", "OrganizationName", "TaxYear", "ReturnType"} // Simple header
     sheet, err := os.Create("resolve.csv")
     if err != nil {
-        panic(err)
+        return fmt.Errorf("failed to create output CSV: %w", err)
     }
+    defer sheet.Close()
     writer := csv.NewWriter(sheet)
 
-    xmler := &Xmler{
-        Record: make(map[string][]string), // Initialize the map
-        Writer: writer,
+    if err := writer.Write(header); err != nil {
+        return fmt.Errorf("failed to write CSV header: %w", err)
     }
-    xmler.Writer.Write(header) 
-    xmler.Writer.Flush()
+    writer.Flush()
+    if err := writer.Error(); err != nil {
+        return fmt.Errorf("failed to flush CSV header: %w", err)
+    }
 
     pathway := "./data/990_zips/"
     reader, err := os.ReadDir(pathway)
     if err != nil {
-        fmt.Println(err)
+        return fmt.Errorf("failed to read directory %s: %w", pathway, err)
     }
+
+    // Use buffered channel to limit concurrent goroutines
+    semaphore := make(chan struct{}, MAXPROCS)
+    var processingErrors sync.Map // Thread-safe error collection
 
     re := regexp.MustCompile(`.zip`)
     for _, zipper := range reader {
         if !re.Match([]byte(zipper.Name())) {
-            zReader, err := os.ReadDir(pathway + zipper.Name())
+            dirPath := filepath.Join(pathway, zipper.Name())
+            zReader, err := os.ReadDir(dirPath)
             if err != nil {
-                fmt.Println(err)
+                log.Printf("Error reading directory %s: %v", dirPath, err)
+                continue
             }
+
             wg.Add(1)
-            go xmler.generateRows(pathway + zipper.Name(), zReader, &wg)
+            semaphore <- struct{}{} // Acquire semaphore
+            go func(path string, files []os.DirEntry) {
+                defer wg.Done()
+                defer func() { <-semaphore }() // Release semaphore
+
+                // Each goroutine gets its own writer and record
+                xmler := &Xmler{
+                    Record: make(map[string][]string),
+                    Writer: writer,
+                }
+
+                if err := xmler.generateRows(path, files); err != nil {
+                    processingErrors.Store(path, err)
+                    log.Printf("Error processing %s: %v", path, err)
+                }
+            }(dirPath, zReader)
         }
     }
 
     wg.Wait()
-}
-
-func (x Xmler) generateRows(root string, files []os.DirEntry, wg *sync.WaitGroup) {
-    defer wg.Done()
-
-
-    for _, file := range files {
-        if file.IsDir() {
-            return
-        }
-        f, err := os.Open(root + "/" + file.Name())
-        if err != nil {
-            panic(err)
-        }
-
-
-        decoder := xml.NewDecoder(f)
-        x.flatten(xml.StartElement{}, decoder, "")
+    writer.Flush()
+    if err := writer.Error(); err != nil {
+        return fmt.Errorf("failed to flush final CSV data: %w", err)
     }
 
-    return
+    return nil
 }
 
-func (x Xmler) flatten(element xml.StartElement, decoder *xml.Decoder, prefix string) {
+func (x *Xmler) generateRows(root string, files []os.DirEntry) error {
+    for _, file := range files {
+        if file.IsDir() {
+            continue
+        }
+
+        filePath := filepath.Join(root, file.Name())
+        f, err := os.Open(filePath)
+        if err != nil {
+            log.Printf("Error opening file %s: %v", filePath, err)
+            continue // Skip this file, process others
+        }
+
+        decoder := xml.NewDecoder(f)
+        if err := x.flatten(xml.StartElement{}, decoder, ""); err != nil {
+            f.Close()
+            log.Printf("Error parsing XML in %s: %v", filePath, err)
+            continue
+        }
+        f.Close()
+    }
+
+    return nil
+}
+
+func (x *Xmler) flatten(element xml.StartElement, decoder *xml.Decoder, prefix string) error {
     var lastTag string
     for {
         tok, err := decoder.Token()
         if err == io.EOF {
+            // Build row from record
             rw.Lock()
             var row []string
             for _, data := range x.Record {
                 length := len(data)
                 if length > 1 {
-                    var insert string
+                    // Use strings.Builder for efficient concatenation
+                    var builder strings.Builder
                     for _, b := range data {
-                        insert += b
+                        builder.WriteString(b)
                     }
-
-                    row = append(row, insert)   
+                    row = append(row, builder.String())
                 } else if length == 1 {
-                    row = append(row, string(data[0]))
-                } else if length == 0 {
+                    row = append(row, data[0])
+                } else {
                     row = append(row, "")
                 }
             }
 
-            x.Writer.Write(row)
+            if err := x.Writer.Write(row); err != nil {
+                rw.Unlock()
+                return fmt.Errorf("failed to write CSV row: %w", err)
+            }
             x.Writer.Flush()
+            if err := x.Writer.Error(); err != nil {
+                rw.Unlock()
+                return fmt.Errorf("failed to flush CSV writer: %w", err)
+            }
             rw.Unlock()
-            //x.Record, _ = Load() 
+
             myInt.Add(1)
-            fmt.Println(myInt.Load())
-            break
+            if myInt.Load()%1000 == 0 {
+                log.Printf("Processed %d files", myInt.Load())
+            }
+            return nil
         }
         if err != nil {
-            log.Fatal(err)
+            return fmt.Errorf("XML parsing error: %w", err)
         }
+
         switch t := tok.(type) {
         case xml.StartElement:
             fullTag := prefix + "." + t.Name.Local
             lastTag = t.Name.Local
             element = t
-            x.flatten(t, decoder, fullTag)
+            if err := x.flatten(t, decoder, fullTag); err != nil {
+                return err
+            }
 
         case xml.CharData:
-            rw.Lock()
             val := strings.TrimSpace(string(t))
             if val != "" {
                 x.Record[prefix] = append(x.Record[prefix], val)
@@ -138,85 +184,104 @@ func (x Xmler) flatten(element xml.StartElement, decoder *xml.Decoder, prefix st
             if _, ok := x.Record[lastTag]; !ok {
                 x.Record[lastTag] = []string{}
             }
-            rw.Unlock()
 
         case xml.EndElement:
             if t.Name.Local == element.Name.Local {
-                return
+                return nil
             }
         }
     }
 }
 
-func UnzipXMLs() {
+func UnzipXMLs() error {
     pathway := "./data/990_zips/"
 
     reader, err := os.ReadDir(pathway)
     if err != nil {
-        fmt.Println(err)
+        return fmt.Errorf("failed to read directory %s: %w", pathway, err)
     }
 
     for _, zipper := range reader {
-        template := pathway + zipper.Name()
-        unzipXMLs(template, template[:len(template) - 4])
+        if !strings.HasSuffix(strings.ToLower(zipper.Name()), ".zip") {
+            continue
+        }
+
+        srcPath := filepath.Join(pathway, zipper.Name())
+        destPath := strings.TrimSuffix(srcPath, filepath.Ext(srcPath))
+
+        if err := unzipXMLs(srcPath, destPath); err != nil {
+            log.Printf("Error unzipping %s: %v", srcPath, err)
+            continue
+        }
     }
+
+    return nil
 }
 
 func unzipXMLs(src, dest string) error {
     r, err := zip.OpenReader(src)
     if err != nil {
-        return err
+        return fmt.Errorf("failed to open zip %s: %w", src, err)
     }
     defer func() {
-        if err := r.Close(); err != nil {
-            panic(err)
+        if closeErr := r.Close(); closeErr != nil {
+            log.Printf("Error closing zip reader for %s: %v", src, closeErr)
         }
     }()
 
-    os.MkdirAll(dest, 0777)
-    extractAndWriteFile := func(f *zip.File) error {
-        rc, err := f.Open()
-        if err != nil {
-            return err
+    if err := os.MkdirAll(dest, 0755); err != nil {
+        return fmt.Errorf("failed to create destination directory %s: %w", dest, err)
+    }
+
+    for _, f := range r.File {
+        if err := extractZipFile(f, dest); err != nil {
+            log.Printf("Error extracting %s from %s: %v", f.Name, src, err)
+            continue
         }
-        defer func() {
-            if err := rc.Close(); err != nil {
-                panic(err)
-            }
-        }()
+    }
 
-        path := filepath.Join(dest, f.Name)
-        if !strings.HasPrefix(path, filepath.Clean(dest) + string(os.PathSeparator)) {
-            return fmt.Errorf("illegal file path: %s", path)
+    return nil
+}
+
+func extractZipFile(f *zip.File, dest string) error {
+    rc, err := f.Open()
+    if err != nil {
+        return fmt.Errorf("failed to open file in zip: %w", err)
+    }
+    defer func() {
+        if closeErr := rc.Close(); closeErr != nil {
+            log.Printf("Error closing zip file %s: %v", f.Name, closeErr)
         }
+    }()
 
-        if f.FileInfo().IsDir() {
-            os.MkdirAll(path, f.Mode())
-        } else {
-            os.MkdirAll(filepath.Dir(path), f.Mode())
-            f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-            if err != nil {
-                return err
-            }
-            defer func() {
-                if err := f.Close(); err != nil {
-                    panic(err)
-                }
-            }()
+    path := filepath.Join(dest, f.Name)
+    if !strings.HasPrefix(path, filepath.Clean(dest)+string(os.PathSeparator)) {
+        return fmt.Errorf("illegal file path (zip slip protection): %s", path)
+    }
 
-            _, err = io.Copy(f, rc)
-            if err != nil {
-                return err
-            }
+    if f.FileInfo().IsDir() {
+        if err := os.MkdirAll(path, 0755); err != nil {
+            return fmt.Errorf("failed to create directory: %w", err)
         }
         return nil
     }
 
-    for _, f := range r.File {
-        err := extractAndWriteFile(f)
-        if err != nil {
-            return err
+    if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+        return fmt.Errorf("failed to create parent directory: %w", err)
+    }
+
+    outFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+    if err != nil {
+        return fmt.Errorf("failed to create output file: %w", err)
+    }
+    defer func() {
+        if closeErr := outFile.Close(); closeErr != nil {
+            log.Printf("Error closing output file %s: %v", path, closeErr)
         }
+    }()
+
+    if _, err = io.Copy(outFile, rc); err != nil {
+        return fmt.Errorf("failed to copy file contents: %w", err)
     }
 
     return nil

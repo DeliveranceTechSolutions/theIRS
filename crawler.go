@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -10,9 +11,72 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/html"
 )
+
+const (
+	maxRetries     = 3
+	retryDelay     = 2 * time.Second
+	requestTimeout = 30 * time.Second
+)
+
+var httpClient = &http.Client{
+	Timeout: requestTimeout,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// httpGetWithRetry performs an HTTP GET with retry logic and exponential backoff
+func httpGetWithRetry(ctx context.Context, url string) (*http.Response, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := retryDelay * time.Duration(1<<uint(attempt-1)) // Exponential backoff
+			log.Printf("Retry %d/%d for %s after %v", attempt+1, maxRetries, url, delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("HTTP request failed (attempt %d/%d): %v", attempt+1, maxRetries, err)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+
+		// For non-200 status codes, decide whether to retry
+		resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			// Server errors - retry
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+			log.Printf("Server error (attempt %d/%d): %v", attempt+1, maxRetries, lastErr)
+			continue
+		}
+
+		// Client errors (4xx) - don't retry
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
+}
 
 type Crawler struct {}
 
@@ -37,50 +101,84 @@ type Version struct {
 
 var ledger map[string]Version
 
-func ScrapeURLs() {
-    var template string
+func ScrapeURLs() error {
+    // Ensure download directory exists
+    if err := os.MkdirAll("./data/990_zips", 0755); err != nil {
+        return fmt.Errorf("failed to create download directory: %w", err)
+    }
+
     for year := currentStart; year <= currentYear; year++ {
-        counter := 12
-        for counter > 0 {
+        for counter := 12; counter > 0; counter-- {
+            var template string
             if year < 2021 {
                 template = upTo20 + fmt.Sprintf(`%d/download990xml_%d_%d.zip`, year, year, counter)
             } else {
                 template = upTo20 + fmt.Sprintf(`%d/%d_TEOS_XML_%02dA.zip`, year, year, counter)
             }
-            fmt.Println(template)
-            res, err := http.Get(template)
-            if err != nil {
-                fmt.Println(err)
-            }
-            defer res.Body.Close()
 
-            out, err := os.Create(fmt.Sprintf(`%d_%d.zip`, year, counter))
-            if err != nil {
-                fmt.Println(err)
-            }
-            defer out.Close()
+            log.Printf("Downloading: %s", template)
 
-            _, err = io.Copy(out, res.Body)
-            fmt.Println(err)
-            counter--
+            // Download to data directory, not current directory
+            destPath := filepath.Join("./data/990_zips", fmt.Sprintf(`%d_%d.zip`, year, counter))
+            if err := downloadFile(template, destPath); err != nil {
+                log.Printf("Error downloading %s: %v", template, err)
+                continue
+            }
         }
     }
+    return nil
+}
+
+func downloadFile(url, destPath string) error {
+    // Check if file already exists and has content
+    if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
+        log.Printf("File %s already exists (%d bytes), skipping", destPath, info.Size())
+        return nil
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), requestTimeout*2)
+    defer cancel()
+
+    res, err := httpGetWithRetry(ctx, url)
+    if err != nil {
+        return fmt.Errorf("HTTP GET failed: %w", err)
+    }
+    defer res.Body.Close()
+
+    out, err := os.Create(destPath)
+    if err != nil {
+        return fmt.Errorf("failed to create file: %w", err)
+    }
+    defer out.Close()
+
+    if _, err = io.Copy(out, res.Body); err != nil {
+        return fmt.Errorf("failed to write file: %w", err)
+    }
+
+    log.Printf("Downloaded: %s", destPath)
+    return nil
 }
 
 func UnpackSchemas() (map[string]Version, error) {
     ledger = make(map[string]Version)
-    res, err := http.Get("https://www.irs.gov/charities-non-profits/tax-exempt-organization-search-teos-schemas")
+
+    ctx, cancel := context.WithTimeout(context.Background(), requestTimeout*2)
+    defer cancel()
+
+    res, err := httpGetWithRetry(ctx, "https://www.irs.gov/charities-non-profits/tax-exempt-organization-search-teos-schemas")
     if err != nil {
-        fmt.Println(err)
+        return nil, fmt.Errorf("failed to fetch schema page: %w", err)
     }
     defer res.Body.Close()
 
     doc, err := html.Parse(res.Body)
     if err != nil {
-        fmt.Println(err)
+        return nil, fmt.Errorf("failed to parse HTML: %w", err)
     }
 
-    os.Mkdir("./data/990_xsd", 0777)
+    if err := os.MkdirAll("./data/990_xsd", 0755); err != nil {
+        return nil, fmt.Errorf("failed to create schema directory: %w", err)
+    }
 
     var walk func(*html.Node)
     walk = func(n *html.Node) {
@@ -88,7 +186,9 @@ func UnpackSchemas() (map[string]Version, error) {
             for _, attr := range n.Attr {
                 if attr.Key == "href" {
                     if strings.Contains(attr.Val, ".zip") {
-                        fetchSchema(attr.Val)
+                        if err := fetchSchema(attr.Val); err != nil {
+                            log.Printf("Error fetching schema %s: %v", attr.Val, err)
+                        }
                     }
                 }
             }
@@ -98,23 +198,28 @@ func UnpackSchemas() (map[string]Version, error) {
         }
     }
     walk(doc)
-    fmt.Printf("%+v", ledger)
+    log.Printf("Fetched %d schema versions", len(ledger))
     return ledger, nil
 }
 
 func UnpackZips() ([]string, error) {
-    res, err := http.Get("https://www.irs.gov/charities-non-profits/form-990-series-downloads")
+    ctx, cancel := context.WithTimeout(context.Background(), requestTimeout*2)
+    defer cancel()
+
+    res, err := httpGetWithRetry(ctx, "https://www.irs.gov/charities-non-profits/form-990-series-downloads")
     if err != nil {
-        fmt.Println(err)
+        return nil, fmt.Errorf("failed to fetch downloads page: %w", err)
     }
     defer res.Body.Close()
 
     doc, err := html.Parse(res.Body)
     if err != nil {
-        fmt.Println(err)
+        return nil, fmt.Errorf("failed to parse HTML: %w", err)
     }
 
-    os.Mkdir(`./data/990_zips/`, 0777) 
+    if err := os.MkdirAll(`./data/990_zips/`, 0755); err != nil {
+        return nil, fmt.Errorf("failed to create zips directory: %w", err)
+    } 
 
     var links []string
     var walk func(*html.Node)
@@ -133,11 +238,17 @@ func UnpackZips() ([]string, error) {
         }
     }
     walk(doc)
-    
+
     var zipData []string
     for _, uri := range links {
-        zipData = append(zipData, fetchZip(uri))
+        tracker, err := fetchZip(uri)
+        if err != nil {
+            log.Printf("Error fetching zip %s: %v", uri, err)
+            continue
+        }
+        zipData = append(zipData, tracker)
     }
+    log.Printf("Downloaded %d zip files", len(zipData))
     return links, nil
 }
 
@@ -214,64 +325,83 @@ func splitYear(uri string, strategy string) string {
 }
 
 
-func fetchSchema(uri string) {
-    fmt.Println(uri)
-    res, err := http.Get(uri)
-    if err != nil {
-        fmt.Println(err)
-    }
-    defer res.Body.Close()
+func fetchSchema(uri string) error {
+    log.Printf("Fetching schema: %s", uri)
 
     year := splitYear(uri, "schema")
     if year != fileYear {
         fileTracker.Store(0)
         fileYear = year
     }
-    fmt.Println(year)
-    out, err := os.Create(fmt.Sprintf(`./data/990_xsd/%s`, year))
-    if err != nil {
-        fmt.Println(err)
-    }
-    defer out.Close()
 
-    _, err = io.Copy(out, res.Body)
-    if err != nil {
-        log.Println(err)
-    }
-}
+    outPath := filepath.Join("./data/990_xsd", year)
 
-func fetchZip(uri string) string {
-    res, err := http.Get(uri)
+    // Check if schema already exists
+    if info, err := os.Stat(outPath); err == nil && info.Size() > 0 {
+        log.Printf("Schema %s already exists (%d bytes), skipping", year, info.Size())
+        return nil
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), requestTimeout*2)
+    defer cancel()
+
+    res, err := httpGetWithRetry(ctx, uri)
     if err != nil {
-        fmt.Println(err)
+        return fmt.Errorf("failed to fetch schema: %w", err)
     }
     defer res.Body.Close()
 
-    // Extract the filename from the URL
-    urlParts := strings.Split(uri, "/")
-    if len(urlParts) == 0 {
-        fmt.Println("Invalid URL:", uri)
-        return ""
-    }
-    
-    filename := urlParts[len(urlParts)-1]
-    
-    // Create the full path for the downloaded file
-    tracker := fmt.Sprintf(`./data/990_zips/%s`, filename)
-    out, err := os.Create(tracker)
+    out, err := os.Create(outPath)
     if err != nil {
-        fmt.Println(err)
+        return fmt.Errorf("failed to create schema file: %w", err)
     }
     defer out.Close()
 
-    _, err = io.Copy(out, res.Body)
-    if err != nil {
-        fmt.Println("Error copying file:", err)
-    } else {
-        fmt.Printf("Downloaded: %s\n", filename)
+    if _, err = io.Copy(out, res.Body); err != nil {
+        return fmt.Errorf("failed to write schema file: %w", err)
     }
-    
-    return tracker 
+
+    log.Printf("Downloaded schema: %s", year)
+    return nil
+}
+
+func fetchZip(uri string) (string, error) {
+    // Extract the filename from the URL
+    urlParts := strings.Split(uri, "/")
+    if len(urlParts) == 0 {
+        return "", fmt.Errorf("invalid URL: %s", uri)
+    }
+
+    filename := urlParts[len(urlParts)-1]
+    tracker := filepath.Join(`./data/990_zips/`, filename)
+
+    // Check if file already exists and has content
+    if info, err := os.Stat(tracker); err == nil && info.Size() > 0 {
+        log.Printf("File %s already exists (%d bytes), skipping", filename, info.Size())
+        return tracker, nil
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), requestTimeout*2)
+    defer cancel()
+
+    res, err := httpGetWithRetry(ctx, uri)
+    if err != nil {
+        return "", fmt.Errorf("failed to fetch zip: %w", err)
+    }
+    defer res.Body.Close()
+
+    out, err := os.Create(tracker)
+    if err != nil {
+        return "", fmt.Errorf("failed to create zip file: %w", err)
+    }
+    defer out.Close()
+
+    if _, err = io.Copy(out, res.Body); err != nil {
+        return "", fmt.Errorf("failed to write zip file: %w", err)
+    }
+
+    log.Printf("Downloaded: %s", filename)
+    return tracker, nil
 }
 
 // CheckAndDownloadMissingZips checks what files are already downloaded and downloads only the missing ones
@@ -319,7 +449,10 @@ func CheckAndDownloadMissingZips() error {
 
 // getAvailableZipFiles fetches the list of available zip files from the IRS website
 func getAvailableZipFiles() ([]string, error) {
-	res, err := http.Get("https://www.irs.gov/charities-non-profits/form-990-series-downloads")
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout*2)
+	defer cancel()
+
+	res, err := httpGetWithRetry(ctx, "https://www.irs.gov/charities-non-profits/form-990-series-downloads")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch IRS page: %w", err)
 	}
@@ -408,24 +541,24 @@ func downloadSingleFile(url, filename string) error {
 	if err := os.MkdirAll(zipDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
-	
+
 	filePath := filepath.Join(zipDir, filename)
-	
+
 	// Check if file already exists and has size > 0
 	if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
-		return fmt.Errorf("file already exists and has content")
+		log.Printf("File %s already exists, skipping", filename)
+		return nil
 	}
-	
-	// Download the file
-	res, err := http.Get(url)
+
+	// Download the file with retry
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout*3)
+	defer cancel()
+
+	res, err := httpGetWithRetry(ctx, url)
 	if err != nil {
 		return fmt.Errorf("failed to download file: %w", err)
 	}
 	defer res.Body.Close()
-	
-	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP error: %d", res.StatusCode)
-	}
 	
 	// Create the output file
 	out, err := os.Create(filePath)

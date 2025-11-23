@@ -30,7 +30,10 @@ data/**
 *theirs*
 .env
 
+.claude*
 *.txt
 *.csv
+
+REFACTORING*
 
 # End of https://www.toptal.com/developers/gitignore/api/go

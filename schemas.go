@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,7 +119,8 @@ func GlobWalk(rootDir, pattern string) ([]string, error) {
             filepath.Join(cwd, "data/990_xsd/output/generated_templates"),
             nil,
         ); err != nil {
-            fmt.Errorf("xsd2go failed for %q: %w", path, err)
+            log.Printf("xsd2go failed for %q: %v", path, err)
+            // Continue processing other files
         }
         // === End per‐file conversion logic ===
 
@@ -173,7 +175,7 @@ func GlobWalk(rootDir, pattern string) ([]string, error) {
 
 
 
-func SchemaGenerator(uri string) {
+func SchemaGenerator(uri string) error {
     err := xsd2go.Convert(
         uri,
         "github.com/synergos-systems/xsd2go",
@@ -181,6 +183,7 @@ func SchemaGenerator(uri string) {
         nil,
     )
     if err != nil {
-        fmt.Println(err)
+        return fmt.Errorf("xsd2go conversion failed: %w", err)
     }
+    return nil
 }
