@@ -35,5 +35,7 @@ data/**
 *.csv
 
 REFACTORING*
+ANSWER.md
+CHANGELOG.md
 
 # End of https://www.toptal.com/developers/gitignore/api/go
